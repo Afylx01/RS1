@@ -16,7 +16,7 @@ CACHE_EXPIRY_HOURS = 12
 INDIA_TZ = pytz.timezone('Asia/Kolkata')
 MARKET_CLOSE_TIME = "15:30"
 INDIA_HOLIDAYS = holidays.India()
-MIN_DATA_DAYS = 260 # 252 for 52-week high + buffer
+MIN_DATA_DAYS = 260
 
 def print_banner():
     """Prints the application banner."""
@@ -29,7 +29,7 @@ def select_symbol_list():
     Finds CSV files matching 'ind_nifty*.csv', prompts the user to select one,
     and returns the list of stock symbols.
     """
-    csv_files = glob.glob('ind_nifty*.csv')
+    csv_files = sorted(glob.glob('ind_nifty*.csv'))
     if not csv_files:
         print("\nError: No 'ind_nifty*.csv' file found.")
         return None
@@ -56,38 +56,68 @@ def select_symbol_list():
 
 def get_data(symbols):
     """
-    Downloads and caches historical stock and NIFTY 50 data.
+    Downloads and caches historical stock and NIFTY 50 data with robust error handling.
     """
     if os.path.exists(CACHE_FILE) and datetime.now() - datetime.fromtimestamp(os.path.getmtime(CACHE_FILE)) < timedelta(hours=CACHE_EXPIRY_HOURS):
         print("Loading data from cache...")
         with open(CACHE_FILE, 'rb') as f: return pickle.load(f)
+
     print("Downloading 5 years of historical data...")
-    symbols_ns = [s + ".NS" for s in symbols] + ['^NSEI']
+    all_stocks = []
+    failed_symbols = []
+
     try:
-        data = yf.download(symbols_ns, period="5y", interval="1d", auto_adjust=True, group_by='symbol')
-        stocks_df_dict = {s.replace('.NS', ''): data[s].dropna() for s in symbols if s + ".NS" in data}
-        nifty_df = data['^NSEI'][['Close']].rename(columns={'Close': 'nifty_close'}).dropna()
-        stocks_df = pd.concat(stocks_df_dict, names=['symbol', 'date']).reset_index()
-        stocks_df.columns = [col.lower() for col in stocks_df.columns]
-        # Keep date as datetime object for resampling
-        stocks_df['date'] = pd.to_datetime(stocks_df['date'])
-        nifty_df.index = pd.to_datetime(nifty_df.index)
-        with open(CACHE_FILE, 'wb') as f: pickle.dump((stocks_df, nifty_df), f)
-        print("Data downloaded and cached.")
-        return stocks_df, nifty_df
+        nifty_ticker = yf.Ticker('^NSEI')
+        nifty_df = nifty_ticker.history(period="5y", interval="1d", auto_adjust=True)
+        if nifty_df.empty:
+            print("\nError: Could not download NIFTY 50 data. Cannot proceed.")
+            return None, None
+        nifty_df = nifty_df[['Close']].rename(columns={'Close': 'nifty_close'})
+        nifty_df.index = pd.to_datetime(nifty_df.index).tz_localize(None) # FIX: Make tz-naive
     except Exception as e:
-        print(f"Error downloading data: {e}")
+        print(f"\nFatal Error downloading NIFTY 50 data: {e}")
         return None, None
 
+    print(f"Downloading data for {len(symbols)} stocks...")
+    for i, symbol in enumerate(symbols):
+        try:
+            print(f"\rDownloading: {i+1}/{len(symbols)} ({symbol})", end="", flush=True)
+            stock_ticker = yf.Ticker(symbol + ".NS")
+            stock_df = stock_ticker.history(period="5y", interval="1d", auto_adjust=True)
+            if not stock_df.empty:
+                stock_df.columns = [col.lower() for col in stock_df.columns]
+                stock_df['symbol'] = symbol
+                all_stocks.append(stock_df)
+            else:
+                failed_symbols.append(symbol)
+        except Exception:
+            failed_symbols.append(symbol)
+
+    print("\n")
+
+    if failed_symbols:
+        print(f"Warning: Failed to download data for {len(failed_symbols)} symbols: {', '.join(failed_symbols)}")
+
+    if not all_stocks:
+        print("\nError: Could not download data for any of the provided stock symbols.")
+        return None, None
+
+    stocks_df = pd.concat(all_stocks).reset_index()
+    stocks_df.rename(columns={'Date': 'date'}, inplace=True)
+    stocks_df['date'] = pd.to_datetime(stocks_df['date']).dt.tz_localize(None)
+
+    with open(CACHE_FILE, 'wb') as f:
+        pickle.dump((stocks_df, nifty_df), f)
+    print("Data downloaded and cached.")
+    return stocks_df, nifty_df
+
 def is_market_closed_for_today():
-    """Checks if the Indian market is closed for the current day."""
     now_india = datetime.now(INDIA_TZ)
     if now_india.weekday() >= 5 or now_india.date() in INDIA_HOLIDAYS: return True
     market_close = INDIA_TZ.localize(datetime.strptime(f"{now_india.strftime('%Y-%m-%d')} {MARKET_CLOSE_TIME}", "%Y-%m-%d %H:%M"))
     return now_india > market_close
 
 def get_scan_dates(available_dates):
-    """Displays the date selection menu and returns the selected date range."""
     print("\n==================================================")
     print("📅 DATE SELECTION MENU")
     print("==================================================")
@@ -116,17 +146,16 @@ def get_scan_dates(available_dates):
         except ValueError: print("Invalid date format.")
 
 def run_scan(all_stocks_df, nifty_df, symbols, scan_dates, config):
-    """Runs the breakout scan for the given dates."""
     results = []
-    print(f"\nScanning {len(symbols)} stocks...")
-    for symbol in symbols:
+    valid_symbols = all_stocks_df['symbol'].unique()
+    print(f"\nScanning {len(valid_symbols)} valid stocks...")
+    for symbol in valid_symbols:
         stock_df = all_stocks_df[all_stocks_df['symbol'] == symbol].copy().set_index('date')
         if len(stock_df) < MIN_DATA_DAYS: continue
         merged_df = stock_df.join(nifty_df, how='inner')
         merged_df = calculate_indicators(merged_df, config)
         merged_df = calculate_rs(merged_df)
         merged_df.columns = [col.lower() for col in merged_df.columns]
-        # Convert scan_dates to datetime objects for comparison
         scan_dates_dt = [pd.to_datetime(d) for d in scan_dates]
         scan_df = merged_df[merged_df.index.isin(scan_dates_dt)]
         for _, row in scan_df.iterrows():
@@ -151,25 +180,40 @@ def run_scan(all_stocks_df, nifty_df, symbols, scan_dates, config):
     return pd.DataFrame(results)
 
 def save_results_to_excel(df):
-    """Saves the results DataFrame to a styled Excel file with clickable links."""
-    # ... (omitted for brevity - same as before)
+    if df.empty: return
+    df['TradingView Link'] = df['symbol'].apply(lambda s: f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{s}", "View Chart")')
+    filename = f"scan_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    try:
+        writer = pd.ExcelWriter(filename, engine='openpyxl')
+        df.to_excel(writer, index=False, sheet_name='Breakouts')
+        worksheet = writer.sheets['Breakouts']
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length: max_length = len(cell.value)
+                except: pass
+            adjusted_width = (max_length + 2)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+        writer.close()
+        print(f"\nResults saved to {filename}")
+    except Exception as e: print(f"\nError saving results to Excel: {e}")
 
 def main():
-    """Main function to run the scanner."""
     print_banner()
     config = configparser.ConfigParser()
     config.read('scanner/config.ini')
     symbols = select_symbol_list()
-    if not symbols:
-        return
+    if not symbols: return
     all_stocks_df, nifty_df = get_data(symbols)
-    if all_stocks_df is None:
+    if all_stocks_df is None or all_stocks_df.empty:
+        print("\nCould not retrieve any valid stock data. Exiting.")
         return
     available_dates = nifty_df.index
     while True:
         scan_dates = get_scan_dates(available_dates)
-        if not scan_dates:
-            continue
+        if not scan_dates: continue
         results_df = run_scan(all_stocks_df, nifty_df, symbols, scan_dates, config)
         if not results_df.empty:
             print("\n📈 Breakout Stocks Found:")
@@ -178,30 +222,7 @@ def main():
         else:
             print("\nNo breakout stocks found for the selected date(s).")
         another_scan = input("\nScan another date range? (y/n): ").strip().lower()
-        if another_scan != 'y':
-            break
+        if another_scan != 'y': break
 
 if __name__ == '__main__':
-    # Re-add save_results_to_excel for standalone execution
-    def save_results_to_excel(df):
-        if df.empty: return
-        df['TradingView Link'] = df['symbol'].apply(lambda s: f'=HYPERLINK("https://www.tradingview.com/chart/?symbol=NSE:{s}", "View Chart")')
-        filename = f"scan_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        try:
-            writer = pd.ExcelWriter(filename, engine='openpyxl')
-            df.to_excel(writer, index=False, sheet_name='Breakouts')
-            worksheet = writer.sheets['Breakouts']
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(cell.value)
-                    except: pass
-                adjusted_width = (max_length + 2)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-            writer.close()
-            print(f"\nResults saved to {filename}")
-        except Exception as e: print(f"\nError saving results to Excel: {e}")
     main()
