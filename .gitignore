@@ -1,9 +1,0 @@
-# Cache files
-data_cache.pkl
-*.xlsx
-
-# Python bytecode
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
