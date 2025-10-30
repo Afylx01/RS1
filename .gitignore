@@ -1,0 +1,10 @@
+# Cache files
+data_cache/
+*.pkl
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Excel results
+*.xlsx

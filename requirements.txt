@@ -1,0 +1,6 @@
+yfinance
+pandas
+pandas-ta
+pytz
+holidays
+openpyxl
